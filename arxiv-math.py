@@ -33,6 +33,7 @@ class ArXivMathDataPipeline:
                 papers.append(line+'\n')
                 if len(papers) % 1000 == 0:
                     out_f.write(''.join(papers))
+                    papers = []
                     if len(papers) % log_interval == 0:
 
                         # stats
