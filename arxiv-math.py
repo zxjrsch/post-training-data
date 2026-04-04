@@ -8,6 +8,7 @@ import bisect
 import matplotlib.pyplot as plt
 import xml.etree.ElementTree as ET
 from typing import Iterator
+from tqdm import tqdm
 
 
 META_DATA_PATH = './arxiv_dataset/arxiv-metadata-oai-snapshot.json'
@@ -238,8 +239,29 @@ class ArXivMathDataPipeline:
             f.write(json.dumps(records, indent=2))
 
         return str(save_path)
+    
+    def verify_filename_validity(self, xml_path=None, inventory_path=None):
+        if xml_path is None:
+            xml_path = './arXiv_src_manifest.xml'
+        if inventory_path is None:
+            inventory_path = self.save_dir / 'inventory.json'
 
-    def find_src_batch(self, save_path=None, hash_table_path=None, metadata_dir=None):
+        with open(inventory_path, 'r') as f:
+            inventory = json.loads(f.read())
+
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+
+        all_files = defaultdict(str)
+        for element in root.findall("file"):
+            filename = element.findtext('filename')
+            yymm = element.findtext('yymm')
+            all_files[filename] = yymm
+
+        for shorthand in tqdm(inventory.keys(), desc=f'Asserting filename validity'):
+            assert f'src/arXiv_src_{shorthand}.tar' in all_files
+
+    def find_src_batch(self, save_dir=None, hash_table_path=None, metadata_dir=None):
         """
         Example arXiv ID '1011.1500'
         Hash table is produced by the parse_arxiv_manifest method
@@ -247,13 +269,15 @@ class ArXivMathDataPipeline:
         if hash_table_path is None:
             hash_table_path = './src_manifest.json'
 
-        if save_path is None:
-            save_path = self.save_dir / 'inventory.json'
+        if save_dir is None:
+            inventory_count_path = self.save_dir / 'inventory_count.json'
+            inventory_path = self.save_dir / 'inventory.json'
 
         with open(hash_table_path, 'r') as f:
             hash_table = json.loads(f.read())
 
         histogram = defaultdict(int)
+        inventory = defaultdict(list)
         i = 0
         for arxiv_id in self.arxiv_ids_iterator(dir_path=metadata_dir):
             i += 1
@@ -261,15 +285,20 @@ class ArXivMathDataPipeline:
             if file is None:
                 continue
             histogram[file] += 1
+            inventory[file].append(arxiv_id)
             if i % 100_000 == 0:
-                print('Processed {i} arXiv IDs')
+                print(f'Processed {i} arXiv IDs')
 
-        with open(save_path, 'w') as f:
+        with open(inventory_count_path, 'w') as f:
             f.write(json.dumps(histogram, indent=2))
 
-        save_path = str(save_path)
-        print(f'Saved to {save_path}')
-        return save_path
+        with open(inventory_path, 'w') as f:
+            f.write(json.dumps(inventory, indent=2))
+
+        print(f'Done, processed {i} arXiv IDs')
+        inventory_path = str(inventory_path)
+        print(f'Saved to {inventory_path}')
+        return inventory_path
 
     def find_src(self, arxiv_id, hash_table, return_compact=True):
         """
@@ -279,9 +308,10 @@ class ArXivMathDataPipeline:
         try:
             shards = hash_table[yymm]
         except KeyError:
-            print(f'Key {yymm} not found.')
             return None
+
         array_id = bisect.bisect_right(shards, arxiv_id) - 1
+ 
         shard_id = str(array_id+1).zfill(3)
         if return_compact:
             remote_path = f'{yymm}_{shard_id}'
@@ -379,4 +409,5 @@ if __name__ == '__main__':
     # arxiv.parse_arxiv_manifest()
     # attn_all_u_need = '1706.03762' # src/arXiv_src_1706_010.tar
     # arxiv.find_src_batch(attn_all_u_need)
-    arxiv.find_src_batch()
+    # arxiv.find_src_batch()
+    arxiv.verify_filename_validity()
