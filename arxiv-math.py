@@ -2,9 +2,13 @@ import json
 from contextlib import ExitStack
 from pathlib import Path
 from time import perf_counter
+from collections import defaultdict
 
+import bisect
 import matplotlib.pyplot as plt
-import numpy as np
+import xml.etree.ElementTree as ET
+from typing import Iterator
+
 
 META_DATA_PATH = './arxiv_dataset/arxiv-metadata-oai-snapshot.json'
 SAVE_DIR = './arxiv_dataset/math_by_category_dedup'
@@ -205,6 +209,102 @@ class ArXivMathDataPipeline:
         print(f'Saved histogram at {save_path}')
         return save_path
 
+    def parse_arxiv_manifest(self, xml_path=None, save_path=None):
+        if xml_path is None:
+            xml_path = './arXiv_src_manifest.xml'
+        
+        if save_path is None:
+            save_path = 'src_manifest.json'
+
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+
+        records_20yy = defaultdict(list)
+        records_19yy = defaultdict(list)
+        for element in root.findall("file"):
+            first_item = element.findtext('first_item')
+            yymm = element.findtext('yymm')
+
+            if yymm.startswith('9'):
+                records_19yy[yymm].append(first_item)
+            else:
+                records_20yy[yymm].append(first_item)
+
+        with open(save_path, 'w') as f:
+            records = {
+                **records_19yy,
+                **records_20yy
+            }
+            f.write(json.dumps(records, indent=2))
+
+        return str(save_path)
+
+    def find_src_batch(self, save_path=None, hash_table_path=None, metadata_dir=None):
+        """
+        Example arXiv ID '1011.1500'
+        Hash table is produced by the parse_arxiv_manifest method
+        """
+        if hash_table_path is None:
+            hash_table_path = './src_manifest.json'
+
+        if save_path is None:
+            save_path = self.save_dir / 'inventory.json'
+
+        with open(hash_table_path, 'r') as f:
+            hash_table = json.loads(f.read())
+
+        histogram = defaultdict(int)
+        i = 0
+        for arxiv_id in self.arxiv_ids_iterator(dir_path=metadata_dir):
+            i += 1
+            file = self.find_src(arxiv_id, hash_table)
+            if file is None:
+                continue
+            histogram[file] += 1
+            if i % 100_000 == 0:
+                print('Processed {i} arXiv IDs')
+
+        with open(save_path, 'w') as f:
+            f.write(json.dumps(histogram, indent=2))
+
+        save_path = str(save_path)
+        print(f'Saved to {save_path}')
+        return save_path
+
+    def find_src(self, arxiv_id, hash_table, return_compact=True):
+        """
+        Refer to find_src_batch method for hash table.
+        """
+        yymm = arxiv_id[:4]
+        try:
+            shards = hash_table[yymm]
+        except KeyError:
+            print(f'Key {yymm} not found.')
+            return None
+        array_id = bisect.bisect_right(shards, arxiv_id) - 1
+        shard_id = str(array_id+1).zfill(3)
+        if return_compact:
+            remote_path = f'{yymm}_{shard_id}'
+        else:
+            remote_path = f'src/arXiv_src_{yymm}_{shard_id}.tar'
+        return remote_path
+    
+    def arxiv_ids_iterator(self, dir_path=None)-> Iterator[str]:
+        """
+        Returns an iterator of arxiv_id
+        """
+        if dir_path is None:
+            dir_path = self.save_dir / 'pure_math'
+        jsonl_files = dir_path.glob('*.jsonl')
+        file_id = 0
+        for jsonl_path in jsonl_files:
+            file_id += 1
+            with open(jsonl_path, 'r') as f:
+                for line in f:
+                    record = json.loads(line.strip())
+                    arxiv_id = record['id']
+                    yield arxiv_id
+    
     def pure_math_categories(self):
         return {
             **self.algebra_filters(),
@@ -275,4 +375,8 @@ if __name__ == '__main__':
     arxiv = ArXivMathDataPipeline()
     # arxiv.filter_math_papers()
     # arxiv.filter_math_by_category()
-    arxiv.plot_pure_math_histogram()
+    # arxiv.plot_pure_math_histogram()
+    # arxiv.parse_arxiv_manifest()
+    # attn_all_u_need = '1706.03762' # src/arXiv_src_1706_010.tar
+    # arxiv.find_src_batch(attn_all_u_need)
+    arxiv.find_src_batch()
