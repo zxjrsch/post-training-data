@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from huggingface_hub import HfApi
 from tqdm import tqdm
 
 META_DATA_PATH = './arxiv_dataset/arxiv-metadata-oai-snapshot.json'
@@ -43,7 +44,7 @@ class ArXivMathDataPipeline:
         self.save_dir.mkdir(exist_ok=True, parents=True)
         self.parquet_output_dir = Path(parquet_output_dir)
         self.parquet_output_dir.mkdir(parents=True, exist_ok=True)
-        self.s3 = boto3.client("s3")
+        self.s3 = boto3.client("s3", region_name="us-east-1")
             
     def filter_math_papers(self, log_interval=50_000):
         """
@@ -445,7 +446,7 @@ class ArXivMathDataPipeline:
         except Exception as e:
             print(f"Error: {e}")
 
-    def process_shard(self, skip: int = 2, shard_len:int = 10, inventory_path: Optional[str|Path]=None, shard_id: Optional[int]=None):
+    def process_shard(self, skip: int = 0, shard_len:int = 50, inventory_path: Optional[str|Path]=None, shard_id: int = 1):
         """
         Downloads shard_len source zipped files from arXiv s3 and export as parquet.
         """
@@ -468,7 +469,8 @@ class ArXivMathDataPipeline:
                 k, v = next(inventory)
                 res = self.download_and_uzip(filename_short=k, unzip_arxiv_ids=v, shard=shard_id, delete_zip=False, delete_unzipped=True)
                 if res is not None:
-                    table = pa.table({'arXiv_src_id': k, 'serialized_document_string': res.serialized_documents})
+                    print(k)
+                    table = pa.table({'arXiv_src_id': [k], 'serialized_document_string': [res.serialized_documents]})
                     if writer is None:
                         writer = pq.ParquetWriter(parquet_path, table.schema)
                     writer.write_table(table)
@@ -478,16 +480,20 @@ class ArXivMathDataPipeline:
      
         return str(parquet_path)
     
-    def inspect_parquet(self):
-        sample_parquet_path = next(self.parquet_output_dir.rglob('*.parquet'))
-        pf = pq.ParquetFile(sample_parquet_path)
+    def inspect_parquet(self, path=None):
+        if path is None:
+            path = next(self.parquet_output_dir.rglob('*.parquet'))
+        pf = pq.ParquetFile(path)
         for batch in pf.iter_batches(batch_size=1):
             row = batch.to_pydict()
-            print(row['arXiv_src_id'])
-            for record in row['serialized_document_string'].split('\n'):
+            print(row['arXiv_src_id'][0])
+            for record in row['serialized_document_string'][0].strip().split('\n'):
                 record = json.loads(record)
                 print(record['arxiv_id'])
-                print(list(record.keys()))                
+                # for latex_file in [k for k in record.keys() if k != 'arxiv_id']:
+                #     print(record[latex_file])
+                #     break
+                
 
     def download_and_uzip(self, filename_short: str, unzip_arxiv_ids: list[str], shard: Optional[int]=None, delete_zip=False, delete_unzipped=True):
         """
@@ -561,12 +567,28 @@ class ArXivMathDataPipeline:
                             extracted_arxiv_ids.add(arxiv_id)
                             pdf_arxiv_ids.append(arxiv_id)
                             continue
-                        # at this point it should be a valid zip
-                        f_content = gzip.decompress(compressed_content)
+                        # at this point it should be a valid zip or single LaTeX file
+                        try:
+                            f_content = gzip.decompress(compressed_content)
+                        except gzip.BadGzipFile:
+                            # single file submission, not gzipped
+                            f_content = compressed_content
                         # extract paper
                         extracted_paper_path = extracted_path / arxiv_id
-                        with tarfile.open(fileobj=io.BytesIO(f_content)) as inner_tar:
-                            inner_tar.extractall(path=extracted_paper_path, filter='data')
+                        try:
+                            with tarfile.open(fileobj=io.BytesIO(f_content)) as inner_tar:
+                                inner_tar.extractall(path=extracted_paper_path, filter='data')
+                        except tarfile.ReadError:
+                            # gzipped single .tex file, not a tarball
+                            files = {
+                                'arxiv_id': arxiv_id,
+                                'main.tex': f_content.decode('utf-8', errors='replace'),
+                            }
+                            line = json.dumps(files) + '\n'
+                            paper_json_lines.append(line)
+                            extracted_arxiv_ids.add(arxiv_id)
+                            continue
+
                         line = self.get_paper_latex(dir_path=extracted_paper_path, arxiv_id=arxiv_id)  # returns serialized string
                         if line is None:
                             continue
@@ -593,10 +615,20 @@ class ArXivMathDataPipeline:
         files = {'arxiv_id': arxiv_id}
         for path in latex_paths:
             k = str(path.relative_to(dir_path))
-            with open(path, 'r') as f:
+            with open(path, 'r', errors='replace') as f:
                 files[k] = f.read().strip()
         return json.dumps(files) + '\n' 
 
+    
+    def upload_parquet(self, hf_user):
+        api = HfApi()
+        api.create_repo(f"{hf_user}/post-train-data-0", repo_type="dataset", private=True, exist_ok=True)
+        api.upload_folder(
+            folder_path="arxiv_dataset/parquet_output",
+            repo_id=f"{hf_user}/post-train-data-0",
+            repo_type="dataset",
+            path_in_repo="data",
+        )
     
 if __name__ == '__main__':
     arxiv = ArXivMathDataPipeline()
@@ -613,5 +645,8 @@ if __name__ == '__main__':
     #     extracted_path='./tar/arXiv_src_1706_010',
     #     unzip_arxiv_ids=['1706.03762', '1706.03627', '1234.5678']
     # )
-    arxiv.process_shard()
     # arxiv.download_and_uzip()
+
+    # arxiv.process_shard()
+    # arxiv.inspect_parquet()
+    arxiv.upload_parquet()
