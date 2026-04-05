@@ -1,15 +1,19 @@
+import bisect
+import gzip
+import io
 import json
+import re
+import tarfile
+import xml.etree.ElementTree as ET
+from collections import defaultdict
 from contextlib import ExitStack
 from pathlib import Path
 from time import perf_counter
-from collections import defaultdict
-
-import bisect
-import matplotlib.pyplot as plt
-import xml.etree.ElementTree as ET
 from typing import Iterator
-from tqdm import tqdm
 
+import boto3
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 META_DATA_PATH = './arxiv_dataset/arxiv-metadata-oai-snapshot.json'
 SAVE_DIR = './arxiv_dataset/math_by_category_dedup'
@@ -20,7 +24,8 @@ class ArXivMathDataPipeline:
         self.metadata_path = Path(metadata_path)
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(exist_ok=True, parents=True)
-
+        self.s3 = boto3.client("s3")
+            
     def filter_math_papers(self, log_interval=50_000):
         """
         Extracts math subset of arXiv metadata.
@@ -401,6 +406,75 @@ class ArXivMathDataPipeline:
             'math.ST': 'Statistics Theory',
         }
     
+    def ls(self, prefix='src/', max_entries=10):
+        """
+        List files from arXiv S3 bucket
+        """
+        try:
+            response = self.s3.list_objects_v2(
+                Bucket='arxiv',
+                Prefix=prefix,
+                Delimiter="/",
+                MaxKeys=max_entries,
+                RequestPayer='requester'
+            )
+            for p in response.get("CommonPrefixes", []):
+                print(f"  [DIR]  {p['Prefix']}")
+            for obj in response.get("Contents", []):
+                print(f"  [FILE] {obj['Key']}  ({obj['Size']} bytes)")
+
+        except Exception as e:
+            print(f"Error: {e}")
+
+    def process_single_zip(self, filename_short: str, arxiv_ids: list[str]):
+        """
+        Example of filename_short: 1706_010
+        """
+        pass
+
+    def download_and_uzip(self, filename_short: str, unzip_arxiv_ids: list[str]):
+        remote_filename = f'src/arXiv_src_{filename_short}.tar'
+        local_filename = f'local_{filename_short}.tar'
+        try:
+            print('Downloading', filename_short)
+            self.s3.download_file(
+                Bucket="arxiv",
+                Key=remote_filename,
+                Filename=local_filename,
+                ExtraArgs={"RequestPayer": "requester"},
+            )
+            # extract bulk
+            with tarfile.open(local_filename) as tar:
+                paper_json_lines = []
+                for arxiv_id in tar.getnames():
+                    if arxiv_id in unzip_arxiv_ids:
+                        f = tar.extractfile(arxiv_id)
+                        f_content = gzip.decompress(f.read())
+                        paper_path = Path(f"local_{arxiv_id}")
+                        # extract paper
+                        with tarfile.open(fileobj=io.BytesIO(f_content)) as inner_tar:
+                            inner_tar.extractall(path=paper_path, filter='data')
+                        line = self.get_paper_latex(dir_path=paper_path)
+                        paper_json_lines.append(line)
+
+                return ''.join(paper_json_lines)
+
+        except Exception as e:
+            print(e)
+            return None
+        
+    def get_paper_latex(self, dir_path):
+        latex_paths = Path(dir_path).rglob('*.tex')
+        assert len(latex_paths)
+        files = {}
+        for path in latex_paths:
+            # k = str(path.relative_to(''))
+            k = str(path)
+            with open(path, 'r') as f:
+                files[k] = f.read().strip()
+        return json.dumps(files) + '\n' 
+
+    
 if __name__ == '__main__':
     arxiv = ArXivMathDataPipeline()
     # arxiv.filter_math_papers()
@@ -410,4 +484,7 @@ if __name__ == '__main__':
     # attn_all_u_need = '1706.03762' # src/arXiv_src_1706_010.tar
     # arxiv.find_src_batch(attn_all_u_need)
     # arxiv.find_src_batch()
-    arxiv.verify_filename_validity()
+    # arxiv.verify_filename_validity()
+    # arxiv.download()
+    # arxiv.extract()
+    arxiv.merge_tex()
