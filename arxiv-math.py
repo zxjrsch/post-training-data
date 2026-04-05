@@ -4,20 +4,32 @@ import io
 import json
 import re
 import tarfile
+import traceback
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Iterator
+from typing import Iterator, List, Optional
 
 import boto3
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+
 META_DATA_PATH = './arxiv_dataset/arxiv-metadata-oai-snapshot.json'
 SAVE_DIR = './arxiv_dataset/math_by_category_dedup'
 
+@dataclass
+class ExtractionResult:
+    """
+    Result of extracting LaTeX documents from an arXiv bundle like s3://arxiv/pdf/arXiv_pdf_1001_003.tar
+    """
+    serialized_documents: str
+    missing_arxiv_ids: List[str]
+    pdf_arxiv_ids: List[str]    # PDF found, but not LaTeX source available
+    
 
 class ArXivMathDataPipeline:
     def __init__(self, metadata_path=META_DATA_PATH, save_dir=SAVE_DIR):
@@ -432,44 +444,90 @@ class ArXivMathDataPipeline:
         """
         pass
 
-    def download_and_uzip(self, filename_short: str, unzip_arxiv_ids: list[str]):
+    def download_and_uzip(self, filename_short: str, unzip_arxiv_ids: list[str], shard: Optional[int]=None):
+        """
+        Short filename example 1706_010 yymm_zzz where zzz is the zip file number.
+        unzip_arxiv_ids are arXiv IDs to be extracted from this zip file 
+        """
+        local_base = self.save_dir / 'download'
+        if shard is not None:
+            local_base = local_base / f'shard_{shard}'
+        
         remote_filename = f'src/arXiv_src_{filename_short}.tar'
-        local_filename = f'local_{filename_short}.tar'
+        local_zip_path = local_base / f'{filename_short}.tar'
+        extracted_path = local_base / f'{filename_short}'
+
         try:
-            print('Downloading', filename_short)
+            # print(f'Downloading {remote_filename}')
             self.s3.download_file(
                 Bucket="arxiv",
                 Key=remote_filename,
-                Filename=local_filename,
+                Filename=local_zip_path,
                 ExtraArgs={"RequestPayer": "requester"},
             )
-            # extract bulk
-            with tarfile.open(local_filename) as tar:
-                paper_json_lines = []
-                for arxiv_id in tar.getnames():
-                    if arxiv_id in unzip_arxiv_ids:
-                        f = tar.extractfile(arxiv_id)
-                        f_content = gzip.decompress(f.read())
-                        paper_path = Path(f"local_{arxiv_id}")
-                        # extract paper
-                        with tarfile.open(fileobj=io.BytesIO(f_content)) as inner_tar:
-                            inner_tar.extractall(path=paper_path, filter='data')
-                        line = self.get_paper_latex(dir_path=paper_path)
-                        paper_json_lines.append(line)
+            result = self.extract_latex_from_zip(
+                local_zip_path=local_zip_path, 
+                extracted_path=extracted_path, 
+                unzip_arxiv_ids=unzip_arxiv_ids
+            )
 
-                return ''.join(paper_json_lines)
+            return result
 
         except Exception as e:
-            print(e)
+            traceback.print_exc()
             return None
         
-    def get_paper_latex(self, dir_path):
-        latex_paths = Path(dir_path).rglob('*.tex')
+    def extract_latex_from_zip(self, local_zip_path: str|Path, extracted_path: str|Path, unzip_arxiv_ids: List[str]):
+        """
+        Returns ExtractionResult 
+        """
+        local_zip_path = Path(local_zip_path)
+        extracted_path = Path(extracted_path)
+        extracted_arxiv_ids = set()
+        pdf_arxiv_ids = []   # arXiv id found in zip but latex source not found
+        with tarfile.open(local_zip_path) as tar:
+            paper_json_lines = []
+            # print(tar.getnames())
+            for gz_path in tar.getnames():
+                arxiv_id = Path(gz_path).stem
+                arxiv_id = str(arxiv_id)
+                if arxiv_id in unzip_arxiv_ids:
+                    try:
+                        f = tar.extractfile(gz_path)
+                        compressed_content = f.read()
+                        if compressed_content[:5] == b'%PDF-':
+                            extracted_arxiv_ids.add(arxiv_id)
+                            pdf_arxiv_ids.append(arxiv_id)
+                            continue
+                        # at this point it should be a valid zip
+                        f_content = gzip.decompress(compressed_content)
+                        # extract paper
+                        extracted_paper_path = extracted_path / arxiv_id
+                        with tarfile.open(fileobj=io.BytesIO(f_content)) as inner_tar:
+                            inner_tar.extractall(path=extracted_paper_path, filter='data')
+                        line = self.get_paper_latex(dir_path=extracted_paper_path, arxiv_id=arxiv_id)  # returns serialized string
+                        paper_json_lines.append(line)
+                        extracted_arxiv_ids.add(arxiv_id)
+                    except Exception as e:
+                        print(f'Error processing arXiv:{arxiv_id} | Local zip path {str(local_zip_path)} | Extracted path {str(extracted_path)}')
+                        traceback.print_exc()
+
+        missing_arxiv_ids = set(unzip_arxiv_ids) - extracted_arxiv_ids
+        # print('arXiv IDs not found:', missing_arxiv_ids, 'PDF exists but no LaTeX:', pdf_arxiv_ids)
+        serialized_documents = ''.join(paper_json_lines)
+        result = ExtractionResult(serialized_documents=serialized_documents, missing_arxiv_ids=missing_arxiv_ids, pdf_arxiv_ids=pdf_arxiv_ids)
+        return result
+        
+    def get_paper_latex(self, dir_path, arxiv_id):
+        """
+        Iterates through a source directory and extracts LaTeX files. Outputs a serialized dict
+        with a key named "arxiv_id" and other keys being the relative file paths and values being file content.
+        """
+        latex_paths = list(Path(dir_path).rglob('*.tex'))
         assert len(latex_paths)
-        files = {}
+        files = {'arxiv_id': arxiv_id}
         for path in latex_paths:
-            # k = str(path.relative_to(''))
-            k = str(path)
+            k = str(path.relative_to(dir_path))
             with open(path, 'r') as f:
                 files[k] = f.read().strip()
         return json.dumps(files) + '\n' 
@@ -485,6 +543,8 @@ if __name__ == '__main__':
     # arxiv.find_src_batch(attn_all_u_need)
     # arxiv.find_src_batch()
     # arxiv.verify_filename_validity()
-    # arxiv.download()
-    # arxiv.extract()
-    arxiv.merge_tex()
+    arxiv.extract_latex_from_zip(
+        local_zip_path='./tar/arXiv_src_1706_010.tar',
+        extracted_path='./tar/arXiv_src_1706_010',
+        unzip_arxiv_ids=['1706.03762', '1706.03627', '1234.5678']
+    )
