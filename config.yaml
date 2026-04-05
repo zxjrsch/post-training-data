@@ -1,6 +1,10 @@
-hf_token: 
-hf_user: 
+hf_token:
+hf_user:
+hf_auto_upload: True
 repo_name: post-training-data-0
 metadata_path: arxiv_dataset/arxiv-metadata-oai-snapshot.json
 save_dir: arxiv_dataset/math_by_category_dedup
 parquet_output_dir: arxiv_dataset/parquet_output
+inventory_json: inventory.json
+remove_zip: True
+progress_stats_dir: arxiv_dataset/log
