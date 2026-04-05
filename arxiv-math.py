@@ -3,6 +3,7 @@ import gzip
 import io
 import json
 import re
+import shutil
 import tarfile
 import traceback
 import xml.etree.ElementTree as ET
@@ -15,13 +16,15 @@ from typing import Iterator, List, Optional
 
 import boto3
 import matplotlib.pyplot as plt
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from tqdm import tqdm
-import shutil
-
-
 
 META_DATA_PATH = './arxiv_dataset/arxiv-metadata-oai-snapshot.json'
 SAVE_DIR = './arxiv_dataset/math_by_category_dedup'
+PARQUET_DIR = './arxiv_dataset/parquet_output'
+
 
 @dataclass
 class ExtractionResult:
@@ -34,10 +37,12 @@ class ExtractionResult:
     
 
 class ArXivMathDataPipeline:
-    def __init__(self, metadata_path=META_DATA_PATH, save_dir=SAVE_DIR):
+    def __init__(self, metadata_path=META_DATA_PATH, save_dir=SAVE_DIR, parquet_output_dir=PARQUET_DIR):
         self.metadata_path = Path(metadata_path)
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(exist_ok=True, parents=True)
+        self.parquet_output_dir = Path(parquet_output_dir)
+        self.parquet_output_dir.mkdir(parents=True, exist_ok=True)
         self.s3 = boto3.client("s3")
             
     def filter_math_papers(self, log_interval=50_000):
@@ -440,11 +445,49 @@ class ArXivMathDataPipeline:
         except Exception as e:
             print(f"Error: {e}")
 
-    def process_single_zip(self, filename_short: str, arxiv_ids: list[str]):
+    def process_shard(self, skip: int = 2, shard_len:int = 10, inventory_path: Optional[str|Path]=None, shard_id: Optional[int]=None):
         """
-        Example of filename_short: 1706_010
+        Downloads shard_len source zipped files from arXiv s3 and export as parquet.
         """
-        pass
+        assert skip >=0 and shard_len > 0
+        
+        if inventory_path is None:
+            inventory_path = self.save_dir / 'inventory.json'
+        with open(inventory_path, 'r') as f:
+            inventory = json.loads(f.read())
+            inventory = iter(inventory.items())
+
+        parquet_path = self.parquet_output_dir / f'shard-{shard_id:04d}-skip-{skip:04d}-len-{shard_len:04d}.parquet'
+
+        for _ in range(skip):
+            next(inventory)
+
+        try:
+            writer = None
+            for _ in range(shard_len):
+                k, v = next(inventory)
+                res = self.download_and_uzip(filename_short=k, unzip_arxiv_ids=v, shard=shard_id, delete_zip=False, delete_unzipped=True)
+                if res is not None:
+                    table = pa.table({'arXiv_src_id': k, 'serialized_document_string': res.serialized_documents})
+                    if writer is None:
+                        writer = pq.ParquetWriter(parquet_path, table.schema)
+                    writer.write_table(table)
+        finally:
+            if writer:
+                writer.close()
+     
+        return str(parquet_path)
+    
+    def inspect_parquet(self):
+        sample_parquet_path = next(self.parquet_output_dir.rglob('*.parquet'))
+        pf = pq.ParquetFile(sample_parquet_path)
+        for batch in pf.iter_batches(batch_size=1):
+            row = batch.to_pydict()
+            print(row['arXiv_src_id'])
+            for record in row['serialized_document_string'].split('\n'):
+                record = json.loads(record)
+                print(record['arxiv_id'])
+                print(list(record.keys()))                
 
     def download_and_uzip(self, filename_short: str, unzip_arxiv_ids: list[str], shard: Optional[int]=None, delete_zip=False, delete_unzipped=True):
         """
@@ -565,9 +608,10 @@ if __name__ == '__main__':
     # arxiv.find_src_batch(attn_all_u_need)
     # arxiv.find_src_batch()
     # arxiv.verify_filename_validity()
-    arxiv.extract_latex_from_zip(
-        local_zip_path='./tar/arXiv_src_1706_010.tar',
-        extracted_path='./tar/arXiv_src_1706_010',
-        unzip_arxiv_ids=['1706.03762', '1706.03627', '1234.5678']
-    )
+    # arxiv.extract_latex_from_zip(
+    #     local_zip_path='./tar/arXiv_src_1706_010.tar',
+    #     extracted_path='./tar/arXiv_src_1706_010',
+    #     unzip_arxiv_ids=['1706.03762', '1706.03627', '1234.5678']
+    # )
+    arxiv.process_shard()
     # arxiv.download_and_uzip()
