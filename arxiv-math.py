@@ -6,6 +6,7 @@ import re
 import shutil
 import tarfile
 import traceback
+import uuid
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from contextlib import ExitStack
@@ -25,7 +26,6 @@ from loguru import logger
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-# TODO shard inventory and get most recent (set inventory path), concurrency
 
 @dataclass
 class ExtractionResult:
@@ -52,6 +52,11 @@ class ArXivMathDataPipeline:
         self.parquet_output_dir.mkdir(parents=True, exist_ok=True)
         self.progress_stats_dir = Path(cfg.progress_stats_dir)
         self.progress_stats_dir.mkdir(exist_ok=True, parents=True)
+
+        self.run_id = uuid.uuid4()
+        logger.add(self.progress_stats_dir / f'run_{self.run_id}.log')
+        logger.info(f'Run {self.run_id}')
+
         self.s3 = boto3.client("s3")
         if 'hf_token' in cfg and 'hf_user' in cfg and 'repo_name' in cfg:
             logger.info(f"Creating HF data repo.")
@@ -91,11 +96,11 @@ class ArXivMathDataPipeline:
                     percentage = round(100 * math_papers/total_papers, 2)
                     dt = perf_counter() - t0
 
-                    print(f'Found {math_papers} math papers | {percentage}% total papers | this shard took {dt} seconds')
+                    logger.info(f'Found {math_papers} math papers | {percentage}% total papers | this shard took {dt} seconds')
                     t0 = perf_counter()
             out_f.write(''.join(papers))
             dt_min = round((perf_counter()-start)/60, 1)
-            print(f'End. Found {math_papers} math papers. Took {dt_min} min')
+            logger.info(f'End. Found {math_papers} math papers. Took {dt_min} min')
 
     def filter_math_by_category(self, math_jsonl_path=None):
         if math_jsonl_path is None:
@@ -133,14 +138,14 @@ class ArXivMathDataPipeline:
                 
                 if i % 100_000 == 0:
                     dt = round(perf_counter()-t0)
-                    print(f'Processed {i} math records | latest 100_000 records took {dt} seconds.')
+                    logger.info(f'Processed {i} math records | latest 100_000 records took {dt} seconds.')
                     t0 = perf_counter()
 
             dt = round(perf_counter()-start_t)
 
             # stats 
             percent_excluded = round(100*num_excluded_records/i, 1)
-            print(f'Complete in {dt} seconds. Saved {i-num_excluded_records} records. Excluded {num_excluded_records} ({percent_excluded}%) records.')
+            logger.info(f'Complete in {dt} seconds. Saved {i-num_excluded_records} records. Excluded {num_excluded_records} ({percent_excluded}%) records.')
         
         with open(self.save_dir / 'pure_math_category_stats.json', 'w') as stats_file:
             stats_file.write(json.dumps(histogram))
@@ -173,7 +178,7 @@ class ArXivMathDataPipeline:
     #     plt.tight_layout()
     #     plt.savefig(save_path)
 
-    #     print(f'Saved histogram at {save_path}')
+    #     logger.info(f'Saved histogram at {save_path}')
     #     return save_path
 
 
@@ -248,7 +253,7 @@ class ArXivMathDataPipeline:
         fig.tight_layout()
         fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
 
-        print(f'Saved histogram at {save_path}')
+        logger.info(f'Saved histogram at {save_path}')
         return save_path
 
     def parse_arxiv_manifest(self, xml_path=None, save_path=None):
@@ -281,6 +286,15 @@ class ArXivMathDataPipeline:
 
         return str(save_path)
     
+    def sort_inventory(self, from_most_recent=True):
+        """"Sort yymm"""
+        with open(self.inventory_json, 'r') as f:
+            inventory = json.loads(f.read())
+            inventory = dict(sorted(inventory.items(), key=lambda item: item[0], reverse=True))
+        with open(self.inventory_json, 'w') as f:
+            f.write(json.dumps(inventory, indent=2))
+        logger.info(f'Sorting complete | from_most_recent {from_most_recent} | path: {str(self.inventory_json)}')
+            
     def verify_filename_validity(self, xml_path=None, inventory_path=None):
         if xml_path is None:
             xml_path = './arXiv_src_manifest.xml'
@@ -328,7 +342,7 @@ class ArXivMathDataPipeline:
             histogram[file] += 1
             inventory[file].append(arxiv_id)
             if i % 100_000 == 0:
-                print(f'Processed {i} arXiv IDs')
+                logger.info(f'Processed {i} arXiv IDs')
 
         with open(inventory_count_path, 'w') as f:
             f.write(json.dumps(histogram, indent=2))
@@ -336,9 +350,9 @@ class ArXivMathDataPipeline:
         with open(inventory_path, 'w') as f:
             f.write(json.dumps(inventory, indent=2))
 
-        print(f'Done, processed {i} arXiv IDs')
+        logger.info(f'Done, processed {i} arXiv IDs')
         inventory_path = str(inventory_path)
-        print(f'Saved to {inventory_path}')
+        logger.info(f'Saved to {inventory_path}')
         return inventory_path
 
     def find_src(self, arxiv_id, hash_table, return_compact=True):
@@ -455,12 +469,12 @@ class ArXivMathDataPipeline:
                 RequestPayer='requester'
             )
             for p in response.get("CommonPrefixes", []):
-                print(f"  [DIR]  {p['Prefix']}")
+                logger.info(f"  [DIR]  {p['Prefix']}")
             for obj in response.get("Contents", []):
-                print(f"  [FILE] {obj['Key']}  ({obj['Size']} bytes)")
+                logger.info(f"  [FILE] {obj['Key']}  ({obj['Size']} bytes)")
 
         except Exception as e:
-            print(f"Error: {e}")
+            logger.info(f"Error: {e}")
 
     def process_shard(self, shard_id: int = 1, skip: int = 0, shard_len:int = 50, inventory_path: Optional[str|Path]=None):
         """
@@ -483,8 +497,8 @@ class ArXivMathDataPipeline:
         for _ in range(skip):
             next(inventory)
 
-        stats = {}
-
+        stats = {'run_id': self.run_id, 'start_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        shard_start_time = perf_counter()
         try:
             writer = None
             for _ in range(shard_len):
@@ -493,7 +507,7 @@ class ArXivMathDataPipeline:
                 res = self.download_and_uzip(filename_short=k, unzip_arxiv_ids=v, shard=shard_id, delete_zip=self.remove_zip, delete_unzipped=True)
                 dt = perf_counter() - t0
                 if res is not None:
-                    print(k)
+                    logger.info(k)
                     table = pa.table({'arXiv_src_id': [k], 'serialized_document_string': [res.serialized_documents]})
                     if writer is None:
                         writer = pq.ParquetWriter(local_parquet_path, table.schema)
@@ -515,6 +529,8 @@ class ArXivMathDataPipeline:
                 writer.close()
 
             with open(stats_path, 'w') as f_stats:
+                stats['end_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                stats['shard_processing_time'] = perf_counter() - shard_start_time
                 f_stats.write(json.dumps(stats, indent=2))
 
         if self.hf_auto_upload:
@@ -528,12 +544,12 @@ class ArXivMathDataPipeline:
         pf = pq.ParquetFile(path)
         for batch in pf.iter_batches(batch_size=1):
             row = batch.to_pydict()
-            print(row['arXiv_src_id'][0])
+            logger.info(row['arXiv_src_id'][0])
             for record in row['serialized_document_string'][0].strip().split('\n'):
                 record = json.loads(record)
-                print(record['arxiv_id'])
+                logger.info(record['arxiv_id'])
                 # for latex_file in [k for k in record.keys() if k != 'arxiv_id']:
-                #     print(record[latex_file])
+                #     logger.info(record[latex_file])
                 #     break
                 
 
@@ -555,7 +571,7 @@ class ArXivMathDataPipeline:
         try:
             t0 = perf_counter()
             if not local_zip_path.exists():
-                # print(f'Downloading {remote_filename}')
+                # logger.info(f'Downloading {remote_filename}')
                 self.s3.download_file(
                     Bucket="arxiv",
                     Key=remote_filename,
@@ -564,7 +580,7 @@ class ArXivMathDataPipeline:
                 )
                 t1 = perf_counter()
                 dt = round(t1-t0)
-                print(f'Downloading {remote_filename} took {dt} seconds.')
+                logger.info(f'Downloading {remote_filename} took {dt} seconds.')
                 t0 = t1
 
             result = self.extract_latex_from_zip(
@@ -574,7 +590,7 @@ class ArXivMathDataPipeline:
             )
             t1 = perf_counter()
             dt = round(t1-t0)
-            print(f'Decompressing & extracting {remote_filename} took {dt} seconds.')
+            logger.info(f'Decompressing & extracting {remote_filename} took {dt} seconds.')
 
             if delete_unzipped:
                 shutil.rmtree(extracted_path, ignore_errors=True)
@@ -583,7 +599,7 @@ class ArXivMathDataPipeline:
             return result
 
         except Exception as e:
-            traceback.print_exc()
+            traceback.logger.info_exc()
             return None
         
     def extract_latex_from_zip(self, local_zip_path: str|Path, extracted_path: str|Path, unzip_arxiv_ids: List[str]):
@@ -597,7 +613,7 @@ class ArXivMathDataPipeline:
         pdf_arxiv_ids = []   # arXiv id found in zip but latex source not found
         with tarfile.open(local_zip_path) as tar:
             paper_json_lines = []
-            # print(tar.getnames())
+            # logger.info(tar.getnames())
             for gz_path in tar.getnames():
                 arxiv_id = re.sub(r'v\d+$', '', Path(gz_path).stem)
                 arxiv_id = str(arxiv_id)
@@ -637,11 +653,11 @@ class ArXivMathDataPipeline:
                         paper_json_lines.append(line)
                         extracted_arxiv_ids.add(arxiv_id)
                     except Exception as e:
-                        print(f'Error processing arXiv:{arxiv_id} | Local zip path {str(local_zip_path)} | Extracted path {str(extracted_path)}')
-                        traceback.print_exc()
+                        logger.info(f'Error processing arXiv:{arxiv_id} | Local zip path {str(local_zip_path)} | Extracted path {str(extracted_path)}')
+                        traceback.logger.info_exc()
 
         missing_arxiv_ids = list(unzip_arxiv_ids - extracted_arxiv_ids)
-        # print('arXiv IDs not found:', missing_arxiv_ids, 'PDF exists but no LaTeX:', pdf_arxiv_ids)
+        # logger.info('arXiv IDs not found:', missing_arxiv_ids, 'PDF exists but no LaTeX:', pdf_arxiv_ids)
         serialized_documents = ''.join(paper_json_lines)
         result = ExtractionResult(serialized_documents=serialized_documents, missing_arxiv_ids=missing_arxiv_ids, pdf_arxiv_ids=pdf_arxiv_ids)
         return result
@@ -701,3 +717,4 @@ if __name__ == '__main__':
 
     # arxiv.process_shard()
     # arxiv.inspect_parquet()
+    arxiv.sort_inventory()
