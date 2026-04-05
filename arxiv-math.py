@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from contextlib import ExitStack
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Iterator, List, Optional
@@ -24,11 +25,7 @@ from loguru import logger
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-# META_DATA_PATH = 'arxiv_dataset/arxiv-metadata-oai-snapshot.json'
-# SAVE_DIR = 'arxiv_dataset/math_by_category_dedup'
-# PARQUET_DIR = 'arxiv_dataset/parquet_output'
-# HF_USR = ''
-
+# TODO shard inventory and get most recent (set inventory path), concurrency
 
 @dataclass
 class ExtractionResult:
@@ -48,8 +45,13 @@ class ArXivMathDataPipeline:
         self.metadata_path = Path(cfg.metadata_path)
         self.save_dir = Path(cfg.save_dir)
         self.save_dir.mkdir(exist_ok=True, parents=True)
+        self.inventory_json = Path(cfg.inventory_json)
+        self.remove_zip = cfg.remove_zip
+        self.hf_auto_upload = cfg.hf_auto_upload
         self.parquet_output_dir = Path(cfg.parquet_output_dir)
         self.parquet_output_dir.mkdir(parents=True, exist_ok=True)
+        self.progress_stats_dir = Path(cfg.progress_stats_dir)
+        self.progress_stats_dir.mkdir(exist_ok=True, parents=True)
         self.s3 = boto3.client("s3")
         if 'hf_token' in cfg and 'hf_user' in cfg and 'repo_name' in cfg:
             logger.info(f"Creating HF data repo.")
@@ -283,7 +285,7 @@ class ArXivMathDataPipeline:
         if xml_path is None:
             xml_path = './arXiv_src_manifest.xml'
         if inventory_path is None:
-            inventory_path = self.save_dir / 'inventory.json'
+            inventory_path = self.inventory_json
 
         with open(inventory_path, 'r') as f:
             inventory = json.loads(f.read())
@@ -310,7 +312,7 @@ class ArXivMathDataPipeline:
 
         if save_dir is None:
             inventory_count_path = self.save_dir / 'inventory_count.json'
-            inventory_path = self.save_dir / 'inventory.json'
+            inventory_path = self.inventory_json
 
         with open(hash_table_path, 'r') as f:
             hash_table = json.loads(f.read())
@@ -460,39 +462,65 @@ class ArXivMathDataPipeline:
         except Exception as e:
             print(f"Error: {e}")
 
-    def process_shard(self, skip: int = 0, shard_len:int = 50, inventory_path: Optional[str|Path]=None, shard_id: int = 1):
+    def process_shard(self, shard_id: int = 1, skip: int = 0, shard_len:int = 50, inventory_path: Optional[str|Path]=None):
         """
-        Downloads shard_len source zipped files from arXiv s3 and export as parquet.
+        Downloads shard_len source zipped files from arXiv s3 and export as parquet, supports huggingface upload
+        Ensure approximately equal number of papers by assigning appropriate shard_len based on self.inventory_json
         """
         assert skip >=0 and shard_len > 0
         
         if inventory_path is None:
-            inventory_path = self.save_dir / 'inventory.json'
+            inventory_path = self.inventory_json
         with open(inventory_path, 'r') as f:
             inventory = json.loads(f.read())
             inventory = iter(inventory.items())
 
-        parquet_path = self.parquet_output_dir / f'shard-{shard_id:04d}-skip-{skip:04d}-len-{shard_len:04d}.parquet'
+        file_name = f'shard-{shard_id:04d}-skip-{skip:04d}-len-{shard_len:04d}'
+        local_parquet_path = self.parquet_output_dir / f'{file_name}.parquet'
+        remote_parquet_path = f'data/{file_name}.parquet'
+        stats_path = self.progress_stats_dir / f'{file_name}.json'
 
         for _ in range(skip):
             next(inventory)
+
+        stats = {}
 
         try:
             writer = None
             for _ in range(shard_len):
                 k, v = next(inventory)
-                res = self.download_and_uzip(filename_short=k, unzip_arxiv_ids=v, shard=shard_id, delete_zip=False, delete_unzipped=True)
+                t0 = perf_counter()
+                res = self.download_and_uzip(filename_short=k, unzip_arxiv_ids=v, shard=shard_id, delete_zip=self.remove_zip, delete_unzipped=True)
+                dt = perf_counter() - t0
                 if res is not None:
                     print(k)
                     table = pa.table({'arXiv_src_id': [k], 'serialized_document_string': [res.serialized_documents]})
                     if writer is None:
-                        writer = pq.ParquetWriter(parquet_path, table.schema)
+                        writer = pq.ParquetWriter(local_parquet_path, table.schema)
                     writer.write_table(table)
+
+                    # record stats
+                    stats[k] = {
+                        'status': 'ok', 
+                        'download_and_uzip took time (seconds)': str(dt),
+                        'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                        'missing_arxiv_ids': ','.join(res.missing_arxiv_ids), 
+                        'pdf_arxiv_ids': ','.join(res.pdf_arxiv_ids),
+                        'requested_arxiv_ids': ','.join(v),
+                    }
+                else:
+                    stats[k] = {'status': 'error', 'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'requested_arxiv_ids': ','.join(v)}
         finally:
             if writer:
                 writer.close()
+
+            with open(stats_path, 'w') as f_stats:
+                f_stats.write(json.dumps(stats, indent=2))
+
+        if self.hf_auto_upload:
+            self.upload_parquet(local_parquet_path=local_parquet_path, remote_parquet_path=remote_parquet_path)
      
-        return str(parquet_path)
+        return str(local_parquet_path)
     
     def inspect_parquet(self, path=None):
         if path is None:
@@ -634,7 +662,7 @@ class ArXivMathDataPipeline:
         return json.dumps(files) + '\n' 
 
     
-    def upload_parquet(self, folder_path=None):
+    def upload_folder(self, folder_path=None):
         if folder_path is None:
             folder_path = self.parquet_output_dir
         assert self.repo_id
@@ -644,9 +672,18 @@ class ArXivMathDataPipeline:
             repo_type="dataset",
             path_in_repo="data",
         )
+
+    def upload_parquet(self, local_parquet_path, remote_parquet_path):
+        assert self.repo_id
+        self.hf.upload_file(
+            path_or_fileobj=local_parquet_path,
+            path_in_repo=remote_parquet_path,
+            repo_id=self.repo_id,
+            repo_type="dataset",
+        )
     
 if __name__ == '__main__':
-    arxiv = ArXivMathDataPipeline()
+    arxiv = ArXivMathDataPipeline(config_yaml_path='config.yaml')
     # arxiv.filter_math_papers()
     # arxiv.filter_math_by_category()
     # arxiv.plot_pure_math_histogram()
@@ -664,4 +701,3 @@ if __name__ == '__main__':
 
     # arxiv.process_shard()
     # arxiv.inspect_parquet()
-    # arxiv.upload_parquet()
