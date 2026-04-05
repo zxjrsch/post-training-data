@@ -16,6 +16,8 @@ from typing import Iterator, List, Optional
 import boto3
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import shutil
+
 
 
 META_DATA_PATH = './arxiv_dataset/arxiv-metadata-oai-snapshot.json'
@@ -61,14 +63,14 @@ class ArXivMathDataPipeline:
                 if len(papers) % 1000 == 0:
                     out_f.write(''.join(papers))
                     papers = []
-                    if len(papers) % log_interval == 0:
+                if math_papers % log_interval == 0:
 
-                        # stats
-                        percentage = round(100 * math_papers/total_papers, 2)
-                        dt = perf_counter() - t0
+                    # stats
+                    percentage = round(100 * math_papers/total_papers, 2)
+                    dt = perf_counter() - t0
 
-                        print(f'Found {math_papers} math papers | {percentage}% total papers | this shard took {dt} seconds')
-                        t0 = perf_counter()
+                    print(f'Found {math_papers} math papers | {percentage}% total papers | this shard took {dt} seconds')
+                    t0 = perf_counter()
             out_f.write(''.join(papers))
             dt_min = round((perf_counter()-start)/60, 1)
             print(f'End. Found {math_papers} math papers. Took {dt_min} min')
@@ -444,7 +446,7 @@ class ArXivMathDataPipeline:
         """
         pass
 
-    def download_and_uzip(self, filename_short: str, unzip_arxiv_ids: list[str], shard: Optional[int]=None):
+    def download_and_uzip(self, filename_short: str, unzip_arxiv_ids: list[str], shard: Optional[int]=None, delete_zip=False, delete_unzipped=True):
         """
         Short filename example 1706_010 yymm_zzz where zzz is the zip file number.
         unzip_arxiv_ids are arXiv IDs to be extracted from this zip file 
@@ -453,24 +455,40 @@ class ArXivMathDataPipeline:
         if shard is not None:
             local_base = local_base / f'shard_{shard}'
         
+        local_base.mkdir(parents=True, exist_ok=True)
+        
         remote_filename = f'src/arXiv_src_{filename_short}.tar'
         local_zip_path = local_base / f'{filename_short}.tar'
         extracted_path = local_base / f'{filename_short}'
 
         try:
-            # print(f'Downloading {remote_filename}')
-            self.s3.download_file(
-                Bucket="arxiv",
-                Key=remote_filename,
-                Filename=local_zip_path,
-                ExtraArgs={"RequestPayer": "requester"},
-            )
+            t0 = perf_counter()
+            if not local_zip_path.exists():
+                # print(f'Downloading {remote_filename}')
+                self.s3.download_file(
+                    Bucket="arxiv",
+                    Key=remote_filename,
+                    Filename=str(local_zip_path),
+                    ExtraArgs={"RequestPayer": "requester"},
+                )
+                t1 = perf_counter()
+                dt = round(t1-t0)
+                print(f'Downloading {remote_filename} took {dt} seconds.')
+                t0 = t1
+
             result = self.extract_latex_from_zip(
                 local_zip_path=local_zip_path, 
                 extracted_path=extracted_path, 
                 unzip_arxiv_ids=unzip_arxiv_ids
             )
+            t1 = perf_counter()
+            dt = round(t1-t0)
+            print(f'Decompressing & extracting {remote_filename} took {dt} seconds.')
 
+            if delete_unzipped:
+                shutil.rmtree(extracted_path, ignore_errors=True)
+            if delete_zip:
+                local_zip_path.unlink(missing_ok=True)
             return result
 
         except Exception as e:
@@ -484,12 +502,13 @@ class ArXivMathDataPipeline:
         local_zip_path = Path(local_zip_path)
         extracted_path = Path(extracted_path)
         extracted_arxiv_ids = set()
+        unzip_arxiv_ids = set(unzip_arxiv_ids)
         pdf_arxiv_ids = []   # arXiv id found in zip but latex source not found
         with tarfile.open(local_zip_path) as tar:
             paper_json_lines = []
             # print(tar.getnames())
             for gz_path in tar.getnames():
-                arxiv_id = Path(gz_path).stem
+                arxiv_id = re.sub(r'v\d+$', '', Path(gz_path).stem)
                 arxiv_id = str(arxiv_id)
                 if arxiv_id in unzip_arxiv_ids:
                     try:
@@ -506,13 +525,15 @@ class ArXivMathDataPipeline:
                         with tarfile.open(fileobj=io.BytesIO(f_content)) as inner_tar:
                             inner_tar.extractall(path=extracted_paper_path, filter='data')
                         line = self.get_paper_latex(dir_path=extracted_paper_path, arxiv_id=arxiv_id)  # returns serialized string
+                        if line is None:
+                            continue
                         paper_json_lines.append(line)
                         extracted_arxiv_ids.add(arxiv_id)
                     except Exception as e:
                         print(f'Error processing arXiv:{arxiv_id} | Local zip path {str(local_zip_path)} | Extracted path {str(extracted_path)}')
                         traceback.print_exc()
 
-        missing_arxiv_ids = set(unzip_arxiv_ids) - extracted_arxiv_ids
+        missing_arxiv_ids = list(unzip_arxiv_ids - extracted_arxiv_ids)
         # print('arXiv IDs not found:', missing_arxiv_ids, 'PDF exists but no LaTeX:', pdf_arxiv_ids)
         serialized_documents = ''.join(paper_json_lines)
         result = ExtractionResult(serialized_documents=serialized_documents, missing_arxiv_ids=missing_arxiv_ids, pdf_arxiv_ids=pdf_arxiv_ids)
@@ -524,7 +545,8 @@ class ArXivMathDataPipeline:
         with a key named "arxiv_id" and other keys being the relative file paths and values being file content.
         """
         latex_paths = list(Path(dir_path).rglob('*.tex'))
-        assert len(latex_paths)
+        if not len(latex_paths):
+            return None
         files = {'arxiv_id': arxiv_id}
         for path in latex_paths:
             k = str(path.relative_to(dir_path))
@@ -548,3 +570,4 @@ if __name__ == '__main__':
         extracted_path='./tar/arXiv_src_1706_010',
         unzip_arxiv_ids=['1706.03762', '1706.03627', '1234.5678']
     )
+    # arxiv.download_and_uzip()
