@@ -20,11 +20,14 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from huggingface_hub import HfApi
+from loguru import logger
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
-META_DATA_PATH = './arxiv_dataset/arxiv-metadata-oai-snapshot.json'
-SAVE_DIR = './arxiv_dataset/math_by_category_dedup'
-PARQUET_DIR = './arxiv_dataset/parquet_output'
+# META_DATA_PATH = 'arxiv_dataset/arxiv-metadata-oai-snapshot.json'
+# SAVE_DIR = 'arxiv_dataset/math_by_category_dedup'
+# PARQUET_DIR = 'arxiv_dataset/parquet_output'
+# HF_USR = ''
 
 
 @dataclass
@@ -38,13 +41,24 @@ class ExtractionResult:
     
 
 class ArXivMathDataPipeline:
-    def __init__(self, metadata_path=META_DATA_PATH, save_dir=SAVE_DIR, parquet_output_dir=PARQUET_DIR):
-        self.metadata_path = Path(metadata_path)
-        self.save_dir = Path(save_dir)
+    def __init__(self, config_yaml_path: str|Path):
+
+        cfg = OmegaConf.load(config_yaml_path)
+
+        self.metadata_path = Path(cfg.metadata_path)
+        self.save_dir = Path(cfg.save_dir)
         self.save_dir.mkdir(exist_ok=True, parents=True)
-        self.parquet_output_dir = Path(parquet_output_dir)
+        self.parquet_output_dir = Path(cfg.parquet_output_dir)
         self.parquet_output_dir.mkdir(parents=True, exist_ok=True)
-        self.s3 = boto3.client("s3", region_name="us-east-1")
+        self.s3 = boto3.client("s3")
+        if 'hf_token' in cfg and 'hf_user' in cfg and 'repo_name' in cfg:
+            logger.info(f"Creating HF data repo.")
+            self.hf = HfApi(token=cfg.hf_token)
+            self.repo_id = f"{cfg.hf_user}/{cfg.repo_name}"
+            self.hf.create_repo(self.repo_id, repo_type="dataset", private=True, exist_ok=True)
+        else:
+            logger.warning(f"hf_token or hf_user or repo_name is not set in {config_yaml_path}")
+
             
     def filter_math_papers(self, log_interval=50_000):
         """
@@ -620,12 +634,13 @@ class ArXivMathDataPipeline:
         return json.dumps(files) + '\n' 
 
     
-    def upload_parquet(self, hf_user):
-        api = HfApi()
-        api.create_repo(f"{hf_user}/post-train-data-0", repo_type="dataset", private=True, exist_ok=True)
-        api.upload_folder(
-            folder_path="arxiv_dataset/parquet_output",
-            repo_id=f"{hf_user}/post-train-data-0",
+    def upload_parquet(self, folder_path=None):
+        if folder_path is None:
+            folder_path = self.parquet_output_dir
+        assert self.repo_id
+        self.hf.upload_folder(
+            folder_path=folder_path,
+            repo_id=self.repo_id,
             repo_type="dataset",
             path_in_repo="data",
         )
@@ -649,4 +664,4 @@ if __name__ == '__main__':
 
     # arxiv.process_shard()
     # arxiv.inspect_parquet()
-    arxiv.upload_parquet()
+    # arxiv.upload_parquet()
