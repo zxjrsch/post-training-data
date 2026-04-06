@@ -1,5 +1,5 @@
-hf_token:
-hf_user:
+hf_token: 
+hf_user: 
 hf_auto_upload: True
 repo_name: post-training-data-0
 metadata_path: arxiv_dataset/arxiv-metadata-oai-snapshot.json
@@ -10,3 +10,5 @@ inventory_json: inventory.json
 remove_zip: True
 progress_stats_dir: arxiv_dataset/log
 authenticate: False
+num_cpus: 64
+workload_path: workload.jsonl
