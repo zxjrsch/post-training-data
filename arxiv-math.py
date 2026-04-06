@@ -50,6 +50,7 @@ class ArXivMathDataPipeline:
         self.hf_auto_upload = cfg.hf_auto_upload
         self.parquet_output_dir = Path(cfg.parquet_output_dir)
         self.parquet_output_dir.mkdir(parents=True, exist_ok=True)
+        self.approx_papers_per_parquet = cfg.approx_papers_per_parquet
         self.progress_stats_dir = Path(cfg.progress_stats_dir)
         self.progress_stats_dir.mkdir(exist_ok=True, parents=True)
 
@@ -57,14 +58,15 @@ class ArXivMathDataPipeline:
         logger.add(self.progress_stats_dir / f'run_{self.run_id}.log')
         logger.info(f'Run {self.run_id}')
 
-        self.s3 = boto3.client("s3")
-        if 'hf_token' in cfg and 'hf_user' in cfg and 'repo_name' in cfg:
-            logger.info(f"Creating HF data repo.")
-            self.hf = HfApi(token=cfg.hf_token)
-            self.repo_id = f"{cfg.hf_user}/{cfg.repo_name}"
-            self.hf.create_repo(self.repo_id, repo_type="dataset", private=True, exist_ok=True)
-        else:
-            logger.warning(f"hf_token or hf_user or repo_name is not set in {config_yaml_path}")
+        if cfg.authenticate:
+            self.s3 = boto3.client("s3")
+            if 'hf_token' in cfg and 'hf_user' in cfg and 'repo_name' in cfg:
+                logger.info(f"Creating HF data repo.")
+                self.hf = HfApi(token=cfg.hf_token)
+                self.repo_id = f"{cfg.hf_user}/{cfg.repo_name}"
+                self.hf.create_repo(self.repo_id, repo_type="dataset", private=True, exist_ok=True)
+            else:
+                logger.warning(f"hf_token or hf_user or repo_name is not set in {config_yaml_path}")
 
             
     def filter_math_papers(self, log_interval=50_000):
@@ -475,13 +477,13 @@ class ArXivMathDataPipeline:
 
         except Exception as e:
             logger.info(f"Error: {e}")
-
-    def process_shard(self, shard_id: int = 1, skip: int = 0, shard_len:int = 50, inventory_path: Optional[str|Path]=None):
+    
+    def process_shard(self, skip: int, num_arxiv_zip_files: int, inventory_path: Optional[str|Path]=None):
         """
         Downloads shard_len source zipped files from arXiv s3 and export as parquet, supports huggingface upload
         Ensure approximately equal number of papers by assigning appropriate shard_len based on self.inventory_json
         """
-        assert skip >=0 and shard_len > 0
+        assert skip >=0 and num_arxiv_zip_files > 0
         
         if inventory_path is None:
             inventory_path = self.inventory_json
@@ -489,7 +491,9 @@ class ArXivMathDataPipeline:
             inventory = json.loads(f.read())
             inventory = iter(inventory.items())
 
-        file_name = f'shard-{shard_id:04d}-skip-{skip:04d}-len-{shard_len:04d}'
+        start_zip = skip+1
+        end_zip = skip + num_arxiv_zip_files
+        file_name = f'arxiv-math-{start_zip:04d}-{end_zip:04d}-shard-1'
         local_parquet_path = self.parquet_output_dir / f'{file_name}.parquet'
         remote_parquet_path = f'data/{file_name}.parquet'
         stats_path = self.progress_stats_dir / f'{file_name}.json'
@@ -501,8 +505,29 @@ class ArXivMathDataPipeline:
         shard_start_time = perf_counter()
         try:
             writer = None
-            for _ in range(shard_len):
+            num_papers_current_shard = 0
+            shard_id = 1
+            for _ in range(num_arxiv_zip_files):
+                if num_papers_current_shard > self.approx_papers_per_shard:
+                    if writer:
+                        writer.close()
+                    if self.hf_auto_upload:
+                        self.upload_parquet(local_parquet_path=local_parquet_path, remote_parquet_path=remote_parquet_path)
+                        stats[f'shard_{shard_id}'] = {
+                            'upload_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            'num_papers': num_papers_current_shard,
+                            'remote_file_path': remote_parquet_path
+                        }
+                    # refresh
+                    writer = None
+                    num_papers_current_shard = 0
+                    shard_id += 1
+                    file_name = f'arxiv-math-{start_zip:04d}-{end_zip:04d}-shard-{shard_id}'
+                    local_parquet_path = self.parquet_output_dir / f'{file_name}.parquet'
+                    remote_parquet_path = f'data/{file_name}.parquet'
+
                 k, v = next(inventory)
+                num_papers_current_shard += len(v)
                 t0 = perf_counter()
                 res = self.download_and_uzip(filename_short=k, unzip_arxiv_ids=v, shard=shard_id, delete_zip=self.remove_zip, delete_unzipped=True)
                 dt = perf_counter() - t0
@@ -697,6 +722,74 @@ class ArXivMathDataPipeline:
             repo_id=self.repo_id,
             repo_type="dataset",
         )
+
+    def divide_workload(self, num_cpus: int=64, workload_path = 'workload.jsonl'):
+        """
+        The current filter has 478567 papers. Suppose there are 8 CPUs (8 workers).
+        Then each processes 60k papers. If each shard is 10k (~500 MB), each worker creates 6 shards (3GB).
+        """
+        PROCESSING_TIME_PER_ZIP = 3 # seconds
+
+        assert num_cpus > 0
+        
+        logger.info(f'Calculating workload share...')
+        with open(self.inventory_json, 'r') as f:
+            inventory = json.loads(f.read())
+        total_papers = 0
+        for k, v in inventory.items():
+            total_papers += len(v)
+        papers_per_cpu = total_papers // num_cpus
+
+        min_zips_per_cpu = float('inf')
+        max_zips_per_cpu = -float('inf')
+
+        workload = []
+        skip = num_arxiv_zip_files = 0
+        cpu = current_cpu_papers = 0
+        current_cpu_zips = []
+        for k, v in inventory.items():
+
+            num_arxiv_zip_files += 1
+            current_cpu_zips.append(k)
+            current_cpu_papers += len(v)
+
+            if current_cpu_papers > papers_per_cpu:
+                max_zips_per_cpu = max(max_zips_per_cpu, num_arxiv_zip_files)
+                min_zips_per_cpu = min(min_zips_per_cpu, num_arxiv_zip_files)
+                job = {
+                    'cpu': cpu,
+                    'skip': skip,
+                    'num_arxiv_zip_files': num_arxiv_zip_files,
+                    'current_cpu_zips': ','.join(current_cpu_zips)
+                }
+                workload.append(json.dumps(job)+'\n')
+                cpu += 1
+                skip += num_arxiv_zip_files
+                num_arxiv_zip_files = 0
+                current_cpu_papers = 0
+                current_cpu_zips = []
+
+        if workload:
+            job = {
+                'cpu': cpu,
+                'skip': skip,
+                'num_arxiv_zip_files': num_arxiv_zip_files,
+                'current_cpu_zips': ','.join(current_cpu_zips)
+            }
+            workload.append(json.dumps(job))
+
+        with open(workload_path, 'w') as workload_f:
+            workload_f.write(''.join(workload))
+
+        logger.info(f'Divided work into {len(workload)} parts, saved to {str(workload_path)}.')
+        num_parquets_per_cpu = (papers_per_cpu + self.approx_papers_per_parquet-1) // self.approx_papers_per_parquet
+        last_shard = papers_per_cpu % self.approx_papers_per_parquet
+        logger.info(f'Total papers {total_papers} | CPUs {num_cpus} | {papers_per_cpu} papers/cpu | {num_parquets_per_cpu} parquet/cpu | {self.approx_papers_per_parquet} papers/shard | Last shard has {last_shard} papers')   
+        
+        min_t = round(PROCESSING_TIME_PER_ZIP * min_zips_per_cpu / 60, 1)
+        max_t = round(PROCESSING_TIME_PER_ZIP * max_zips_per_cpu / 60, 1)
+
+        logger.info(f'Estimated Finish Time: {min_t} - {max_t} min.')
     
 if __name__ == '__main__':
     arxiv = ArXivMathDataPipeline(config_yaml_path='config.yaml')
@@ -717,4 +810,5 @@ if __name__ == '__main__':
 
     # arxiv.process_shard()
     # arxiv.inspect_parquet()
-    arxiv.sort_inventory()
+    # arxiv.sort_inventory()
+    arxiv.divide_workload()
