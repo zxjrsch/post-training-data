@@ -9,9 +9,11 @@ import traceback
 import uuid
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
+from multiprocessing import Pool
 from pathlib import Path
 from time import perf_counter
 from typing import Iterator, List, Optional
@@ -54,9 +56,12 @@ class ArXivMathDataPipeline:
         self.progress_stats_dir = Path(cfg.progress_stats_dir)
         self.progress_stats_dir.mkdir(exist_ok=True, parents=True)
 
-        self.run_id = uuid.uuid4()
+        self.run_id = str(uuid.uuid4())
         logger.add(self.progress_stats_dir / f'run_{self.run_id}.log')
         logger.info(f'Run {self.run_id}')
+
+        self.num_cpus = cfg.num_cpus
+        self.workload_path = Path(cfg.workload_path)
 
         if cfg.authenticate:
             self.s3 = boto3.client("s3")
@@ -292,7 +297,7 @@ class ArXivMathDataPipeline:
         """"Sort yymm"""
         with open(self.inventory_json, 'r') as f:
             inventory = json.loads(f.read())
-            inventory = dict(sorted(inventory.items(), key=lambda item: item[0], reverse=True))
+            inventory = dict(sorted(inventory.items(), key=lambda item: item[0], reverse=from_most_recent))
         with open(self.inventory_json, 'w') as f:
             f.write(json.dumps(inventory, indent=2))
         logger.info(f'Sorting complete | from_most_recent {from_most_recent} | path: {str(self.inventory_json)}')
@@ -328,7 +333,9 @@ class ArXivMathDataPipeline:
 
         if save_dir is None:
             inventory_count_path = self.save_dir / 'inventory_count.json'
-            inventory_path = self.inventory_json
+        else:
+            inventory_count_path = save_dir / 'inventory_count.json'
+        inventory_path = self.inventory_json
 
         with open(hash_table_path, 'r') as f:
             hash_table = json.loads(f.read())
@@ -508,7 +515,7 @@ class ArXivMathDataPipeline:
             num_papers_current_shard = 0
             shard_id = 1
             for _ in range(num_arxiv_zip_files):
-                if num_papers_current_shard > self.approx_papers_per_shard:
+                if num_papers_current_shard > self.approx_papers_per_parquet:
                     if writer:
                         writer.close()
                     if self.hf_auto_upload:
@@ -624,7 +631,7 @@ class ArXivMathDataPipeline:
             return result
 
         except Exception as e:
-            traceback.logger.info_exc()
+            traceback.print_exc()
             return None
         
     def extract_latex_from_zip(self, local_zip_path: str|Path, extracted_path: str|Path, unzip_arxiv_ids: List[str]):
@@ -645,6 +652,8 @@ class ArXivMathDataPipeline:
                 if arxiv_id in unzip_arxiv_ids:
                     try:
                         f = tar.extractfile(gz_path)
+                        if f is None:
+                            continue
                         compressed_content = f.read()
                         if compressed_content[:5] == b'%PDF-':
                             extracted_arxiv_ids.add(arxiv_id)
@@ -679,7 +688,7 @@ class ArXivMathDataPipeline:
                         extracted_arxiv_ids.add(arxiv_id)
                     except Exception as e:
                         logger.info(f'Error processing arXiv:{arxiv_id} | Local zip path {str(local_zip_path)} | Extracted path {str(extracted_path)}')
-                        traceback.logger.info_exc()
+                        traceback.print_exc()
 
         missing_arxiv_ids = list(unzip_arxiv_ids - extracted_arxiv_ids)
         # logger.info('arXiv IDs not found:', missing_arxiv_ids, 'PDF exists but no LaTeX:', pdf_arxiv_ids)
@@ -723,13 +732,17 @@ class ArXivMathDataPipeline:
             repo_type="dataset",
         )
 
-    def divide_workload(self, num_cpus: int=64, workload_path = 'workload.jsonl'):
+    def divide_workload(self, num_cpus=None, workload_path=None):
         """
         The current filter has 478567 papers. Suppose there are 8 CPUs (8 workers).
         Then each processes 60k papers. If each shard is 10k (~500 MB), each worker creates 6 shards (3GB).
         """
         PROCESSING_TIME_PER_ZIP = 3 # seconds
 
+        if num_cpus is None:
+            num_cpus = self.num_cpus
+        if workload_path is None:
+            workload_path = self.workload_path
         assert num_cpus > 0
         
         logger.info(f'Calculating workload share...')
@@ -769,7 +782,7 @@ class ArXivMathDataPipeline:
                 current_cpu_papers = 0
                 current_cpu_zips = []
 
-        if workload:
+        if current_cpu_zips:
             job = {
                 'cpu': cpu,
                 'skip': skip,
@@ -790,6 +803,32 @@ class ArXivMathDataPipeline:
         max_t = round(PROCESSING_TIME_PER_ZIP * max_zips_per_cpu / 60, 1)
 
         logger.info(f'Estimated Finish Time: {min_t} - {max_t} min.')
+        return workload
+    
+    def get_run_args(self):
+        workload = self.divide_workload()
+
+        args = []
+        for job_line in workload:
+            job = json.loads(job_line.strip())
+            args.append((job['skip'], job['num_arxiv_zip_files']))
+
+        return args
+
+    def run(self, use_pool=False):
+
+        logger.info(f'Running with pool or ThreadPoolExecutor')
+        args = self.get_run_args()
+        if use_pool:
+            with Pool(self.num_cpus) as p:
+                p.starmap(self.process_shard, args)
+        else:
+            with ThreadPoolExecutor(max_workers=self.num_cpus) as executor:
+                futures = [executor.submit(self.process_shard, skip, n) for skip, n in args]
+                for f in futures:
+                    f.result()
+
+        logger.info(f'Run complete.')
     
 if __name__ == '__main__':
     arxiv = ArXivMathDataPipeline(config_yaml_path='config.yaml')
@@ -811,4 +850,5 @@ if __name__ == '__main__':
     # arxiv.process_shard()
     # arxiv.inspect_parquet()
     # arxiv.sort_inventory()
-    arxiv.divide_workload()
+    # arxiv.divide_workload()
+    arxiv.run()
