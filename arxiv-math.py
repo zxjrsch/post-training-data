@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from boto3.s3.transfer import TransferConfig
 from huggingface_hub import HfApi
 from loguru import logger
 from omegaconf import OmegaConf
@@ -554,8 +555,17 @@ class ArXivMathDataPipeline:
                         'pdf_arxiv_ids': ','.join(res.pdf_arxiv_ids),
                         'requested_arxiv_ids': ','.join(v),
                     }
+
+                    with open(stats_path, 'w') as f_stats:
+                        stats['last_recorded'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        stats['shard_processing_time'] = perf_counter() - shard_start_time
+                        f_stats.write(json.dumps(stats, indent=2))
                 else:
                     stats[k] = {'status': 'error', 'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'requested_arxiv_ids': ','.join(v)}
+                    with open(stats_path, 'w') as f_stats:
+                        stats['last_recorded'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        stats['shard_processing_time'] = perf_counter() - shard_start_time
+                        f_stats.write(json.dumps(stats, indent=2))
         finally:
             if writer:
                 writer.close()
@@ -604,11 +614,13 @@ class ArXivMathDataPipeline:
             t0 = perf_counter()
             if not local_zip_path.exists():
                 # logger.info(f'Downloading {remote_filename}')
+                config = TransferConfig(max_concurrency=10, multipart_chunksize=8*1024*1024)
                 self.s3.download_file(
                     Bucket="arxiv",
                     Key=remote_filename,
                     Filename=str(local_zip_path),
                     ExtraArgs={"RequestPayer": "requester"},
+                    Config=config
                 )
                 t1 = perf_counter()
                 dt = round(t1-t0)
@@ -634,67 +646,128 @@ class ArXivMathDataPipeline:
             traceback.print_exc()
             return None
         
-    def extract_latex_from_zip(self, local_zip_path: str|Path, extracted_path: str|Path, unzip_arxiv_ids: List[str]):
-        """
-        Returns ExtractionResult 
-        """
+    # def extract_latex_from_zip(self, local_zip_path: str|Path, extracted_path: str|Path, unzip_arxiv_ids: List[str]):
+    #     """
+    #     Returns ExtractionResult 
+    #     """
+    #     local_zip_path = Path(local_zip_path)
+    #     extracted_path = Path(extracted_path)
+    #     extracted_arxiv_ids = set()
+    #     unzip_arxiv_ids = set(unzip_arxiv_ids)
+    #     pdf_arxiv_ids = []   # arXiv id found in zip but latex source not found
+    #     with tarfile.open(local_zip_path) as tar:
+    #         paper_json_lines = []
+    #         # logger.info(tar.getnames())
+    #         for gz_path in tar.getnames():
+    #             arxiv_id = re.sub(r'v\d+$', '', Path(gz_path).stem)
+    #             arxiv_id = str(arxiv_id)
+    #             if arxiv_id in unzip_arxiv_ids:
+    #                 try:
+    #                     f = tar.extractfile(gz_path)
+    #                     if f is None:
+    #                         continue
+    #                     compressed_content = f.read()
+    #                     if compressed_content[:5] == b'%PDF-':
+    #                         extracted_arxiv_ids.add(arxiv_id)
+    #                         pdf_arxiv_ids.append(arxiv_id)
+    #                         continue
+    #                     # at this point it should be a valid zip or single LaTeX file
+    #                     try:
+    #                         f_content = gzip.decompress(compressed_content)
+    #                     except gzip.BadGzipFile:
+    #                         # single file submission, not gzipped
+    #                         f_content = compressed_content
+    #                     # extract paper
+    #                     extracted_paper_path = extracted_path / arxiv_id
+    #                     try:
+    #                         with tarfile.open(fileobj=io.BytesIO(f_content)) as inner_tar:
+    #                             inner_tar.extractall(path=extracted_paper_path, filter='data')
+    #                     except tarfile.ReadError:
+    #                         # gzipped single .tex file, not a tarball
+    #                         files = {
+    #                             'arxiv_id': arxiv_id,
+    #                             'main.tex': f_content.decode('utf-8', errors='replace'),
+    #                         }
+    #                         line = json.dumps(files) + '\n'
+    #                         paper_json_lines.append(line)
+    #                         extracted_arxiv_ids.add(arxiv_id)
+    #                         continue
+
+    #                     line = self.get_paper_latex(dir_path=extracted_paper_path, arxiv_id=arxiv_id)  # returns serialized string
+    #                     if line is None:
+    #                         continue
+    #                     paper_json_lines.append(line)
+    #                     extracted_arxiv_ids.add(arxiv_id)
+    #                 except Exception as e:
+    #                     logger.info(f'Error processing arXiv:{arxiv_id} | Local zip path {str(local_zip_path)} | Extracted path {str(extracted_path)}')
+    #                     traceback.print_exc()
+
+    #     missing_arxiv_ids = list(unzip_arxiv_ids - extracted_arxiv_ids)
+    #     # logger.info('arXiv IDs not found:', missing_arxiv_ids, 'PDF exists but no LaTeX:', pdf_arxiv_ids)
+    #     serialized_documents = ''.join(paper_json_lines)
+    #     result = ExtractionResult(serialized_documents=serialized_documents, missing_arxiv_ids=missing_arxiv_ids, pdf_arxiv_ids=pdf_arxiv_ids)
+    #     return result
+
+    def extract_latex_from_zip(self, local_zip_path, extracted_path, unzip_arxiv_ids):
         local_zip_path = Path(local_zip_path)
-        extracted_path = Path(extracted_path)
         extracted_arxiv_ids = set()
         unzip_arxiv_ids = set(unzip_arxiv_ids)
-        pdf_arxiv_ids = []   # arXiv id found in zip but latex source not found
+        pdf_arxiv_ids = []
+        
         with tarfile.open(local_zip_path) as tar:
             paper_json_lines = []
-            # logger.info(tar.getnames())
             for gz_path in tar.getnames():
                 arxiv_id = re.sub(r'v\d+$', '', Path(gz_path).stem)
                 arxiv_id = str(arxiv_id)
-                if arxiv_id in unzip_arxiv_ids:
-                    try:
-                        f = tar.extractfile(gz_path)
-                        if f is None:
-                            continue
-                        compressed_content = f.read()
-                        if compressed_content[:5] == b'%PDF-':
-                            extracted_arxiv_ids.add(arxiv_id)
-                            pdf_arxiv_ids.append(arxiv_id)
-                            continue
-                        # at this point it should be a valid zip or single LaTeX file
-                        try:
-                            f_content = gzip.decompress(compressed_content)
-                        except gzip.BadGzipFile:
-                            # single file submission, not gzipped
-                            f_content = compressed_content
-                        # extract paper
-                        extracted_paper_path = extracted_path / arxiv_id
-                        try:
-                            with tarfile.open(fileobj=io.BytesIO(f_content)) as inner_tar:
-                                inner_tar.extractall(path=extracted_paper_path, filter='data')
-                        except tarfile.ReadError:
-                            # gzipped single .tex file, not a tarball
-                            files = {
-                                'arxiv_id': arxiv_id,
-                                'main.tex': f_content.decode('utf-8', errors='replace'),
-                            }
-                            line = json.dumps(files) + '\n'
-                            paper_json_lines.append(line)
-                            extracted_arxiv_ids.add(arxiv_id)
-                            continue
-
-                        line = self.get_paper_latex(dir_path=extracted_paper_path, arxiv_id=arxiv_id)  # returns serialized string
-                        if line is None:
-                            continue
-                        paper_json_lines.append(line)
+                if arxiv_id not in unzip_arxiv_ids:
+                    continue
+                try:
+                    f = tar.extractfile(gz_path)
+                    if f is None:
+                        continue
+                    compressed_content = f.read()
+                    if compressed_content[:5] == b'%PDF-':
                         extracted_arxiv_ids.add(arxiv_id)
-                    except Exception as e:
-                        logger.info(f'Error processing arXiv:{arxiv_id} | Local zip path {str(local_zip_path)} | Extracted path {str(extracted_path)}')
-                        traceback.print_exc()
+                        pdf_arxiv_ids.append(arxiv_id)
+                        continue
+                    try:
+                        f_content = gzip.decompress(compressed_content)
+                    except gzip.BadGzipFile:
+                        f_content = compressed_content
+                    
+                    # Try as inner tarball — read .tex files in memory
+                    try:
+                        with tarfile.open(fileobj=io.BytesIO(f_content)) as inner_tar:
+                            files = {'arxiv_id': arxiv_id}
+                            for member in inner_tar.getmembers():
+                                if member.isfile() and member.name.endswith('.tex'):
+                                    tex_f = inner_tar.extractfile(member)
+                                    if tex_f:
+                                        files[member.name] = tex_f.read().decode('utf-8', errors='replace').strip()
+                            if len(files) > 1:  # has at least one .tex
+                                paper_json_lines.append(json.dumps(files) + '\n')
+                                extracted_arxiv_ids.add(arxiv_id)
+                                continue
+                    except tarfile.ReadError:
+                        pass
+                    
+                    # Single .tex file
+                    files = {
+                        'arxiv_id': arxiv_id,
+                        'main.tex': f_content.decode('utf-8', errors='replace'),
+                    }
+                    paper_json_lines.append(json.dumps(files) + '\n')
+                    extracted_arxiv_ids.add(arxiv_id)
+                except Exception as e:
+                    logger.info(f'Error processing arXiv:{arxiv_id} | {str(local_zip_path)}')
+                    traceback.print_exc()
 
         missing_arxiv_ids = list(unzip_arxiv_ids - extracted_arxiv_ids)
-        # logger.info('arXiv IDs not found:', missing_arxiv_ids, 'PDF exists but no LaTeX:', pdf_arxiv_ids)
-        serialized_documents = ''.join(paper_json_lines)
-        result = ExtractionResult(serialized_documents=serialized_documents, missing_arxiv_ids=missing_arxiv_ids, pdf_arxiv_ids=pdf_arxiv_ids)
-        return result
+        return ExtractionResult(
+            serialized_documents=''.join(paper_json_lines),
+            missing_arxiv_ids=missing_arxiv_ids,
+            pdf_arxiv_ids=pdf_arxiv_ids
+        )
         
     def get_paper_latex(self, dir_path, arxiv_id):
         """
